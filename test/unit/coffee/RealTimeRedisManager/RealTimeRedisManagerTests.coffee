@@ -11,14 +11,21 @@ describe "RealTimeRedisManager", ->
 			auth: () ->
 			exec: sinon.stub()
 		@rclient.multi = () => @rclient
+		@pubsubClient = 
+			publish: sinon.stub()
 		@RealTimeRedisManager = SandboxedModule.require modulePath, requires:
-			"redis-sharelatex": createClient: () => @rclient
+			"redis-sharelatex": createClient: (config) =>  if (config.name is 'pubsub') then @pubsubClient else @rclient
 			"settings-sharelatex":
 				redis:
-					realtime: @settings =
+					documentupdater: @settings =
 						key_schema:
 							pendingUpdates: ({doc_id}) -> "PendingUpdates:#{doc_id}"
+					pubsub:
+						name: "pubsub"
 			"logger-sharelatex": { log: () -> }
+			"crypto": @crypto = { randomBytes: sinon.stub().withArgs(4).returns(Buffer.from([0x1, 0x2, 0x3, 0x4])) }
+			"os": @os = {hostname: sinon.stub().returns("somehost")}
+
 		@doc_id = "doc-id-123"
 		@project_id = "project-id-123"
 		@callback = sinon.stub()
@@ -74,3 +81,11 @@ describe "RealTimeRedisManager", ->
 		
 		it "should return the length", ->
 			@callback.calledWith(null, @length).should.equal true
+
+	describe "sendData", ->
+		beforeEach ->
+			@message_id = "doc:somehost:01020304-0"
+			@RealTimeRedisManager.sendData({op: "thisop"})
+		
+		it "should send the op with a message id", ->
+			@pubsubClient.publish.calledWith("applied-ops", JSON.stringify({op:"thisop",_id:@message_id})).should.equal true

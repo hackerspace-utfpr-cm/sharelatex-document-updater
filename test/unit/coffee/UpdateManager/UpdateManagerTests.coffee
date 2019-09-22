@@ -23,6 +23,7 @@ describe "UpdateManager", ->
 			"settings-sharelatex": @Settings = {}
 			"./DocumentManager": @DocumentManager = {}
 			"./RangesManager": @RangesManager = {}
+			"./SnapshotManager": @SnapshotManager = {}
 			"./Profiler": class Profiler
 				log: sinon.stub().returns { end: sinon.stub() }
 				end: sinon.stub()
@@ -158,7 +159,8 @@ describe "UpdateManager", ->
 
 	describe "applyUpdate", ->
 		beforeEach ->
-			@update = {op: [{p: 42, i: "foo"}]}
+			@updateMeta = { user_id: 'last-author-fake-id' }
+			@update = {op: [{p: 42, i: "foo"}], meta: @updateMeta}
 			@updatedDocLines = ["updated", "lines"]
 			@version = 34
 			@lines = ["original", "lines"]
@@ -169,7 +171,7 @@ describe "UpdateManager", ->
 			@project_ops_length = sinon.stub()
 			@pathname = '/a/b/c.tex'
 			@DocumentManager.getDoc = sinon.stub().yields(null, @lines, @version, @ranges, @pathname, @projectHistoryId)
-			@RangesManager.applyUpdate = sinon.stub().yields(null, @updated_ranges)
+			@RangesManager.applyUpdate = sinon.stub().yields(null, @updated_ranges, false)
 			@ShareJsUpdateManager.applyUpdate = sinon.stub().yields(null, @updatedDocLines, @version, @appliedOps)
 			@RedisManager.updateDocument = sinon.stub().yields(null, @doc_ops_length, @project_ops_length)
 			@RealTimeRedisManager.sendData = sinon.stub()
@@ -192,7 +194,7 @@ describe "UpdateManager", ->
 
 			it "should save the document", ->
 				@RedisManager.updateDocument
-					.calledWith(@project_id, @doc_id, @updatedDocLines, @version, @appliedOps, @updated_ranges)
+					.calledWith(@project_id, @doc_id, @updatedDocLines, @version, @appliedOps, @updated_ranges, @updateMeta)
 					.should.equal true
 
 			it "should add metadata to the ops" , ->
@@ -238,6 +240,25 @@ describe "UpdateManager", ->
 
 			it "should call the callback with the error", ->
 				@callback.calledWith(@error).should.equal true
+
+		describe "when ranges get collapsed", ->
+			beforeEach ->
+				@RangesManager.applyUpdate = sinon.stub().yields(null, @updated_ranges, true)
+				@SnapshotManager.recordSnapshot = sinon.stub().yields()
+				@UpdateManager.applyUpdate @project_id, @doc_id, @update, @callback
+
+			it "should call SnapshotManager.recordSnapshot", ->
+				@SnapshotManager.recordSnapshot
+					.calledWith(
+						@project_id,
+						@doc_id,
+						@version,
+						@pathname,
+						@lines,
+						@ranges
+					)
+					.should.equal true
+
 
 	describe "_addProjectHistoryMetadataToOps", ->
 		it "should add projectHistoryId, pathname and doc_length metadata to the ops", ->

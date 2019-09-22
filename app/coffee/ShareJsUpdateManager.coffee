@@ -6,6 +6,9 @@ Keys = require "./UpdateKeys"
 {EventEmitter} = require "events"
 util = require "util"
 RealTimeRedisManager = require "./RealTimeRedisManager"
+crypto = require "crypto"
+metrics = require('./Metrics')
+Errors = require("./Errors")
 
 ShareJsModel:: = {}
 util.inherits ShareJsModel, EventEmitter
@@ -22,7 +25,8 @@ module.exports = ShareJsUpdateManager =
 	applyUpdate: (project_id, doc_id, update, lines, version, callback = (error, updatedDocLines) ->) ->
 		logger.log project_id: project_id, doc_id: doc_id, update: update, "applying sharejs updates"
 		jobs = []
-
+		# record the update version before it is modified
+		incomingUpdateVersion = update.v
 		# We could use a global model for all docs, but we're hitting issues with the
 		# internal state of ShareJS not being accessible for clearing caches, and
 		# getting stuck due to queued callbacks (line 260 of sharejs/server/model.coffee)
@@ -34,14 +38,29 @@ module.exports = ShareJsUpdateManager =
 		model.applyOp doc_key, update, (error) ->
 			if error?
 				if error == "Op already submitted"
+					metrics.inc "sharejs.already-submitted"
 					logger.warn {project_id, doc_id, update}, "op has already been submitted"
 					update.dup = true
 					ShareJsUpdateManager._sendOp(project_id, doc_id, update)
+				else if /^Delete component/.test(error)
+					metrics.inc "sharejs.delete-mismatch"
+					logger.warn {project_id, doc_id, update, shareJsErr: error}, "sharejs delete does not match"
+					error = new Errors.DeleteMismatchError("Delete component does not match")
+					return callback(error)
 				else
+					metrics.inc "sharejs.other-error"
 					return callback(error)
 			logger.log project_id: project_id, doc_id: doc_id, error: error, "applied update"
 			model.getSnapshot doc_key, (error, data) =>
 				return callback(error) if error?
+				# only check hash when present and no other updates have been applied 
+				if update.hash? and incomingUpdateVersion == version
+					ourHash = ShareJsUpdateManager._computeHash(data.snapshot)
+					if ourHash != update.hash
+						metrics.inc "sharejs.hash-fail"
+						return callback(new Error("Invalid hash"))
+					else
+						metrics.inc "sharejs.hash-pass", 0.001
 				docLines = data.snapshot.split(/\r\n|\n|\r/)
 				callback(null, docLines, data.v, model.db.appliedOps[doc_key] or [])
 
@@ -52,4 +71,10 @@ module.exports = ShareJsUpdateManager =
 	
 	_sendOp: (project_id, doc_id, op) ->
 		RealTimeRedisManager.sendData {project_id, doc_id, op}
+
+	_computeHash: (content) ->
+		return crypto.createHash('sha1')
+			.update("blob " + content.length + "\x00")
+			.update(content, 'utf8')
+			.digest('hex')
 

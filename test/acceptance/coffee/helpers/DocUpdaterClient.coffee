@@ -1,10 +1,10 @@
 Settings = require('settings-sharelatex')
-rclient = require("redis-sharelatex").createClient(Settings.redis.realtime)
-keys = Settings.redis.realtime.key_schema
+rclient = require("redis-sharelatex").createClient(Settings.redis.documentupdater)
+keys = Settings.redis.documentupdater.key_schema
 request = require("request").defaults(jar: false)
 async = require "async"
 
-rclient_sub = require("redis-sharelatex").createClient(Settings.redis.realtime)
+rclient_sub = require("redis-sharelatex").createClient(Settings.redis.pubsub)
 rclient_sub.subscribe "applied-ops"
 rclient_sub.setMaxListeners(0)
 	
@@ -74,6 +74,9 @@ module.exports = DocUpdaterClient =
 
 	deleteProject: (project_id, callback = () ->) ->
 		request.del "http://localhost:3003/project/#{project_id}", callback
+
+	deleteProjectOnShutdown: (project_id, callback = () ->) ->
+		request.del "http://localhost:3003/project/#{project_id}?background=true&shutdown=true", callback
 
 	acceptChange: (project_id, doc_id, change_id, callback = () ->) ->
 		request.post "http://localhost:3003/project/#{project_id}/doc/#{doc_id}/change/#{change_id}/accept", callback

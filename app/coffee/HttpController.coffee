@@ -4,6 +4,8 @@ ProjectManager = require "./ProjectManager"
 Errors = require "./Errors"
 logger = require "logger-sharelatex"
 Metrics = require "./Metrics"
+ProjectFlusher = require("./ProjectFlusher")
+
 
 TWO_MEGABYTES = 2 * 1024 * 1024
 
@@ -25,7 +27,7 @@ module.exports = HttpController =
 			logger.log project_id: project_id, doc_id: doc_id, "got doc via http"
 			if !lines? or !version?
 				return next(new Errors.NotFoundError("document not found"))
-			res.send JSON.stringify
+			res.json
 				id: doc_id
 				lines: lines
 				version: version
@@ -129,7 +131,10 @@ module.exports = HttpController =
 		project_id = req.params.project_id
 		logger.log project_id: project_id, "deleting project via http"
 		timer = new Metrics.Timer("http.deleteProject")
-		ProjectManager.flushAndDeleteProjectWithLocks project_id, (error) ->
+		options = {}
+		options.background = true if req.query?.background # allow non-urgent flushes to be queued
+		options.skip_history_flush = true if req.query?.shutdown # don't flush history when realtime shuts down
+		ProjectManager.flushAndDeleteProjectWithLocks project_id, options, (error) ->
 			timer.done()
 			return next(error) if error?
 			logger.log project_id: project_id, "deleted project via http"
@@ -179,3 +184,18 @@ module.exports = HttpController =
 			return next(error) if error?
 			logger.log {project_id}, "queued project history resync via http"
 			res.send 204
+
+	flushAllProjects: (req, res, next = (error)-> )->
+		res.setTimeout(5 * 60 * 1000)
+		options = 
+			limit : req.query.limit || 1000
+			concurrency : req.query.concurrency || 5
+			dryRun : req.query.dryRun || false
+		ProjectFlusher.flushAllProjects options, (err, project_ids)->
+			if err?
+				logger.err err:err, "error bulk flushing projects"
+				res.send 500
+			else
+				res.send project_ids
+
+

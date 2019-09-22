@@ -20,16 +20,30 @@ module.exports = HistoryManager =
 			else if res.statusCode < 200 and res.statusCode >= 300
 				logger.error { doc_id, project_id }, "track changes api returned a failure status code: #{res.statusCode}"
 
+	# flush changes in the background
 	flushProjectChangesAsync: (project_id) ->
 		return if !Settings.apis?.project_history?.enabled
+		HistoryManager.flushProjectChanges project_id, {background:true},  ->
 
+	# flush changes and callback (for when we need to know the queue is flushed)
+	flushProjectChanges: (project_id, options, callback = (error) ->) ->
+		return callback() if !Settings.apis?.project_history?.enabled
+		if options.skip_history_flush
+			logger.log {project_id}, "skipping flush of project history from realtime shutdown"
+			return callback()
 		url = "#{Settings.apis.project_history.url}/project/#{project_id}/flush"
-		logger.log { project_id, url }, "flushing doc in project history api"
-		request.post url, (error, res, body)->
+		qs = {}
+		qs.background = true if options.background # pass on the background flush option if present
+		logger.log { project_id, url, qs }, "flushing doc in project history api"
+		request.post {url: url, qs: qs}, (error, res, body)->
 			if error?
 				logger.error { error, project_id}, "project history doc to track changes api"
+				return callback(error)
 			else if res.statusCode < 200 and res.statusCode >= 300
 				logger.error { project_id }, "project history api returned a failure status code: #{res.statusCode}"
+				return callback(error)
+			else
+				return callback()
 
 	FLUSH_DOC_EVERY_N_OPS: 100
 	FLUSH_PROJECT_EVERY_N_OPS: 500
@@ -65,10 +79,12 @@ module.exports = HistoryManager =
 		newBlock  = Math.floor(length / threshold)
 		return newBlock != prevBlock
 
+	MAX_PARALLEL_REQUESTS: 4
+
 	resyncProjectHistory: (project_id, projectHistoryId, docs, files, callback) ->
 		ProjectHistoryRedisManager.queueResyncProjectStructure project_id, projectHistoryId, docs, files, (error) ->
 			return callback(error) if error?
 			DocumentManager = require "./DocumentManager"
 			resyncDoc = (doc, cb) ->
 				DocumentManager.resyncDocContentsWithLock project_id, doc.doc, cb
-			async.each docs, resyncDoc, callback
+			async.eachLimit docs, HistoryManager.MAX_PARALLEL_REQUESTS, resyncDoc, callback

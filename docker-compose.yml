@@ -1,7 +1,7 @@
 # This file was auto-generated, do not edit it directly.
 # Instead run bin/update_build_scripts from
 # https://github.com/sharelatex/sharelatex-dev-environment
-# Version: 1.0.1
+# Version: 1.1.21
 
 version: "2"
 
@@ -11,23 +11,45 @@ services:
     volumes:
       - .:/app
     working_dir: /app
-    entrypoint: npm run test:unit
+    environment:
+      MOCHA_GREP: ${MOCHA_GREP}
+      NODE_ENV: test
+    command: npm run test:unit
+    user: node
 
   test_acceptance:
-    image: node:6.9.5
+    build: .
     volumes:
       - .:/app
+    working_dir: /app
     environment:
+      ELASTIC_SEARCH_DSN: es:9200
       REDIS_HOST: redis
       MONGO_HOST: mongo
+      POSTGRES_HOST: postgres
+      MOCHA_GREP: ${MOCHA_GREP}
+      LOG_LEVEL: ERROR
+      NODE_ENV: test
+    user: node
     depends_on:
-      - redis
       - mongo
-    working_dir: /app
-    entrypoint: npm run test:acceptance
+      - redis
+    command: npm run test:acceptance
+
+
+
+  tar:
+    build: .
+    image: ci/$PROJECT_NAME:$BRANCH_NAME-$BUILD_NUMBER
+    volumes:
+      - ./:/tmp/build/
+    command: tar -czf /tmp/build/build.tar.gz --exclude=build.tar.gz --exclude-vcs .
+    user: root
 
   redis:
     image: redis
 
   mongo:
     image: mongo:3.4
+
+

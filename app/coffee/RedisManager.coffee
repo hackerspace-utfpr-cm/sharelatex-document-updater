@@ -1,6 +1,5 @@
 Settings = require('settings-sharelatex')
 rclient = require("redis-sharelatex").createClient(Settings.redis.documentupdater)
-_ = require('underscore')
 logger = require('logger-sharelatex')
 metrics = require('./Metrics')
 Errors = require "./Errors"
@@ -16,16 +15,8 @@ MAX_REDIS_REQUEST_LENGTH = 5000 # 5 seconds
 # Make times easy to read
 minutes = 60 # seconds for Redis expire
 
-# LUA script to write document and return hash
-# arguments: docLinesKey docLines
-setScript = """
-	redis.call('set', KEYS[1], ARGV[1])
-	return redis.sha1hex(ARGV[1])
-"""
-
 logHashErrors = Settings.documentupdater?.logHashErrors
 logHashReadErrors = logHashErrors?.read
-logHashWriteErrors = logHashErrors?.write
 
 MEGABYTES = 1024 * 1024
 MAX_RANGES_SIZE = 3 * MEGABYTES
@@ -53,7 +44,7 @@ module.exports = RedisManager =
 				logger.error {err: error, doc_id, project_id}, error.message
 				return callback(error)
 			multi = rclient.multi()
-			multi.eval setScript, 1, keys.docLines(doc_id:doc_id), docLines
+			multi.set keys.docLines(doc_id:doc_id), docLines
 			multi.set keys.projectKey({doc_id:doc_id}), project_id
 			multi.set keys.docVersion(doc_id:doc_id), version
 			multi.set keys.docHash(doc_id:doc_id), docHash
@@ -65,10 +56,6 @@ module.exports = RedisManager =
 			multi.set keys.projectHistoryId(doc_id:doc_id), projectHistoryId
 			multi.exec (error, result) ->
 				return callback(error) if error?
-				# check the hash computed on the redis server
-				writeHash = result?[0]
-				if logHashWriteErrors and writeHash? and writeHash isnt docHash
-					logger.error project_id: project_id, doc_id: doc_id, writeHash: writeHash, origHash: docHash, docLines:docLines, "hash mismatch on putDocInMemory"
 				# update docsInProject set
 				rclient.sadd keys.docsInProject(project_id:project_id), doc_id, callback
 
@@ -91,6 +78,8 @@ module.exports = RedisManager =
 		multi.del keys.pathname(doc_id:doc_id)
 		multi.del keys.projectHistoryId(doc_id:doc_id)
 		multi.del keys.unflushedTime(doc_id:doc_id)
+		multi.del keys.lastUpdatedAt(doc_id: doc_id)
+		multi.del keys.lastUpdatedBy(doc_id: doc_id)
 		multi.exec (error) ->
 			return callback(error) if error?
 			multi = rclient.multi()
@@ -121,7 +110,9 @@ module.exports = RedisManager =
 		multi.get keys.pathname(doc_id:doc_id)
 		multi.get keys.projectHistoryId(doc_id:doc_id)
 		multi.get keys.unflushedTime(doc_id:doc_id)
-		multi.exec (error, [docLines, version, storedHash, doc_project_id, ranges, pathname, projectHistoryId, unflushedTime])->
+		multi.get keys.lastUpdatedAt(doc_id: doc_id)
+		multi.get keys.lastUpdatedBy(doc_id: doc_id)
+		multi.exec (error, [docLines, version, storedHash, doc_project_id, ranges, pathname, projectHistoryId, unflushedTime, lastUpdatedAt, lastUpdatedBy])->
 			timeSpan = timer.done()
 			return callback(error) if error?
 			# check if request took too long and bail out.  only do this for
@@ -153,14 +144,14 @@ module.exports = RedisManager =
 
 			# doc is not in redis, bail out
 			if !docLines?
-				return callback null, docLines, version, ranges, pathname, projectHistoryId, unflushedTime
+				return callback null, docLines, version, ranges, pathname, projectHistoryId, unflushedTime, lastUpdatedAt, lastUpdatedBy
 
 			# doc should be in project set, check if missing (workaround for missing docs from putDoc)
 			rclient.sadd keys.docsInProject(project_id:project_id), doc_id, (error, result) ->
 				return callback(error) if error?
 				if result isnt 0 # doc should already be in set
 					logger.error project_id: project_id, doc_id: doc_id, doc_project_id: doc_project_id, "doc missing from docsInProject set"
-				callback null, docLines, version, ranges, pathname, projectHistoryId, unflushedTime
+				callback null, docLines, version, ranges, pathname, projectHistoryId, unflushedTime, lastUpdatedAt, lastUpdatedBy
 
 	getDocVersion: (doc_id, callback = (error, version) ->) ->
 		rclient.get keys.docVersion(doc_id: doc_id), (error, version) ->
@@ -210,7 +201,7 @@ module.exports = RedisManager =
 
 	DOC_OPS_TTL: 60 * minutes
 	DOC_OPS_MAX_LENGTH: 100
-	updateDocument : (project_id, doc_id, docLines, newVersion, appliedOps = [], ranges, callback = (error) ->)->
+	updateDocument : (project_id, doc_id, docLines, newVersion, appliedOps = [], ranges, updateMeta, callback = (error) ->)->
 		RedisManager.getDocVersion doc_id, (error, currentVersion) ->
 			return callback(error) if error?
 			if currentVersion + appliedOps.length != newVersion
@@ -244,7 +235,7 @@ module.exports = RedisManager =
 					logger.error err: error, doc_id: doc_id, ranges: ranges, error.message
 					return callback(error)
 				multi = rclient.multi()
-				multi.eval setScript, 1, keys.docLines(doc_id:doc_id), newDocLines  # index 0
+				multi.set    keys.docLines(doc_id:doc_id), newDocLines  # index 0
 				multi.set    keys.docVersion(doc_id:doc_id), newVersion             # index 1
 				multi.set    keys.docHash(doc_id:doc_id), newHash                   # index 2
 				multi.ltrim  keys.docOps(doc_id: doc_id), -RedisManager.DOC_OPS_MAX_LENGTH, -1 # index 3
@@ -262,12 +253,13 @@ module.exports = RedisManager =
 					# hasn't been modified before (the content in mongo has been
 					# valid up to this point). Otherwise leave it alone ("NX" flag).
 					multi.set    keys.unflushedTime(doc_id: doc_id), Date.now(), "NX"
+					multi.set keys.lastUpdatedAt(doc_id: doc_id), Date.now() # index 8
+					if updateMeta?.user_id
+						multi.set keys.lastUpdatedBy(doc_id: doc_id), updateMeta.user_id # index 9
+					else
+						multi.del keys.lastUpdatedBy(doc_id: doc_id) # index 9
 				multi.exec (error, result) ->
 						return callback(error) if error?
-						# check the hash computed on the redis server
-						writeHash = result?[0]
-						if logHashWriteErrors and writeHash? and writeHash isnt newHash
-							logger.error doc_id: doc_id, writeHash: writeHash, origHash: newHash, docLines:newDocLines, "hash mismatch on updateDocument"
 
 						# length of uncompressedHistoryOps queue (index 7)
 						docUpdateCount = result[7]

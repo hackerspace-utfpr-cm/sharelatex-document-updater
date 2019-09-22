@@ -36,6 +36,8 @@ describe "RedisManager", ->
 								projectHistoryId: ({doc_id}) -> "ProjectHistoryId:#{doc_id}"
 								projectState: ({project_id}) -> "ProjectState:#{project_id}"
 								unflushedTime: ({doc_id}) -> "UnflushedTime:#{doc_id}"
+								lastUpdatedBy: ({doc_id}) -> "lastUpdatedBy:#{doc_id}"
+								lastUpdatedAt: ({doc_id}) -> "lastUpdatedAt:#{doc_id}"
 						history:
 							key_schema:
 								uncompressedHistoryOps: ({doc_id}) -> "UncompressedHistoryOps:#{doc_id}"
@@ -55,13 +57,13 @@ describe "RedisManager", ->
 			globals:
 				JSON: @JSON = JSON
 
-		afterEach ->
-			tk.reset()
-
 		@doc_id = "doc-id-123"
 		@project_id = "project-id-123"
 		@projectHistoryId = 123
 		@callback = sinon.stub()
+
+	afterEach ->
+		tk.reset()
 
 	describe "getDoc", ->
 		beforeEach ->
@@ -116,6 +118,16 @@ describe "RedisManager", ->
 					.calledWith("ProjectHistoryId:#{@doc_id}")
 					.should.equal true
 
+			it "should get lastUpdatedAt", ->
+				@multi.get
+					.calledWith("lastUpdatedAt:#{@doc_id}")
+					.should.equal true
+
+			it "should get lastUpdatedBy", ->
+				@multi.get
+					.calledWith("lastUpdatedBy:#{@doc_id}")
+					.should.equal true
+
 			it "should check if the document is in the DocsIn set", ->
 				@rclient.sadd
 					.calledWith("DocsIn:#{@project_id}")
@@ -123,7 +135,7 @@ describe "RedisManager", ->
 
 			it 'should return the document', ->
 				@callback
-					.calledWithExactly(null, @lines, @version, @ranges, @pathname, @projectHistoryId, @unflushed_time)
+					.calledWithExactly(null, @lines, @version, @ranges, @pathname, @projectHistoryId, @unflushed_time, @lastUpdatedAt, @lastUpdatedBy)
 					.should.equal true
 
 			it 'should not log any errors', ->
@@ -132,7 +144,7 @@ describe "RedisManager", ->
 
 		describe "when the document is not present", ->
 			beforeEach ->
-				@multi.exec = sinon.stub().callsArgWith(0, null, [null, null, null, null, null, null, null, null])
+				@multi.exec = sinon.stub().callsArgWith(0, null, [null, null, null, null, null, null, null, null, null, null])
 				@rclient.sadd = sinon.stub().yields()
 				@RedisManager.getDoc @project_id, @doc_id, @callback
 
@@ -143,7 +155,7 @@ describe "RedisManager", ->
 
 			it 'should return an empty result', ->
 				@callback
-					.calledWithExactly(null, null, 0, {}, null, null, null)
+					.calledWithExactly(null, null, 0, {}, null, null, null, null, null)
 					.should.equal true
 
 			it 'should not log any errors', ->
@@ -161,7 +173,7 @@ describe "RedisManager", ->
 
 			it 'should return the document', ->
 				@callback
-					.calledWithExactly(null, @lines, @version, @ranges, @pathname, @projectHistoryId, @unflushed_time)
+					.calledWithExactly(null, @lines, @version, @ranges, @pathname, @projectHistoryId, @unflushed_time, @lastUpdatedAt, @lastUpdatedBy)
 					.should.equal true
 
 		describe "with a corrupted document", ->
@@ -329,6 +341,7 @@ describe "RedisManager", ->
 			@version = 42
 			@hash = crypto.createHash('sha1').update(JSON.stringify(@lines),'utf8').digest('hex')
 			@ranges = { comments: "mock", entries: "mock" }
+			@updateMeta = { user_id: 'last-author-fake-id' }
 			@doc_update_list_length = sinon.stub()
 			@project_update_list_length = sinon.stub()
 
@@ -338,9 +351,8 @@ describe "RedisManager", ->
 			@multi.expire = sinon.stub()
 			@multi.ltrim = sinon.stub()
 			@multi.del = sinon.stub()
-			@multi.eval = sinon.stub()
 			@multi.exec = sinon.stub().callsArgWith(0, null,
-				[@hash, null, null, null, null, null, null, @doc_update_list_length]
+				[@hash, null, null, null, null, null, null, @doc_update_list_length, null, null]
 			)
 			@ProjectHistoryRedisManager.queueOps = sinon.stub().callsArgWith(
 				@ops.length + 1, null, @project_update_list_length
@@ -353,7 +365,7 @@ describe "RedisManager", ->
 			describe "with project history enabled", ->
 				beforeEach ->
 					@settings.apis.project_history.enabled = true
-					@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @callback
+					@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @updateMeta, @callback
 
 				it "should get the current doc version to check for consistency", ->
 					@RedisManager.getDocVersion
@@ -361,8 +373,8 @@ describe "RedisManager", ->
 						.should.equal true
 
 				it "should set the doclines", ->
-					@multi.eval
-						.calledWith(sinon.match(/redis.call/), 1, "doclines:#{@doc_id}", JSON.stringify(@lines))
+					@multi.set
+						.calledWith("doclines:#{@doc_id}", JSON.stringify(@lines))
 						.should.equal true
 
 				it "should set the version", ->
@@ -383,6 +395,16 @@ describe "RedisManager", ->
 				it "should set the unflushed time", ->
 					@multi.set
 						.calledWith("UnflushedTime:#{@doc_id}", Date.now(), "NX")
+						.should.equal true
+
+				it "should set the last updated time", ->
+					@multi.set
+						.calledWith("lastUpdatedAt:#{@doc_id}", Date.now())
+						.should.equal true
+
+				it "should set the last updater", ->
+					@multi.set
+						.calledWith("lastUpdatedBy:#{@doc_id}", 'last-author-fake-id')
 						.should.equal true
 
 				it "should push the doc op into the doc ops list", ->
@@ -423,7 +445,7 @@ describe "RedisManager", ->
 				beforeEach ->
 					@rclient.rpush = sinon.stub()
 					@settings.apis.project_history.enabled = false
-					@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @callback
+					@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @updateMeta, @callback
 
 				it "should not push the updates into the project history ops list", ->
 					@rclient.rpush.called.should.equal false
@@ -436,7 +458,7 @@ describe "RedisManager", ->
 		describe "with an inconsistent version", ->
 			beforeEach ->
 				@RedisManager.getDocVersion.withArgs(@doc_id).yields(null, @version - @ops.length - 1)
-				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @callback
+				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @updateMeta, @callback
 
 			it "should not call multi.exec", ->
 				@multi.exec.called.should.equal false
@@ -450,7 +472,7 @@ describe "RedisManager", ->
 			beforeEach ->
 				@rclient.rpush = sinon.stub().callsArgWith(1, null, @project_update_list_length)
 				@RedisManager.getDocVersion.withArgs(@doc_id).yields(null, @version)
-				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, [], @ranges, @callback
+				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, [], @ranges, @updateMeta, @callback
 
 			it "should not try to enqueue doc updates", ->
 				@multi.rpush
@@ -463,14 +485,14 @@ describe "RedisManager", ->
 					.should.equal false
 
 			it "should still set the doclines", ->
-				@multi.eval
-					.calledWith(sinon.match(/redis.call/), 1, "doclines:#{@doc_id}", JSON.stringify(@lines))
+				@multi.set
+					.calledWith("doclines:#{@doc_id}", JSON.stringify(@lines))
 					.should.equal true
 
 		describe "with empty ranges", ->
 			beforeEach ->
 				@RedisManager.getDocVersion.withArgs(@doc_id).yields(null, @version - @ops.length)
-				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, {}, @callback
+				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, {}, @updateMeta, @callback
 
 			it "should not set the ranges", ->
 				@multi.set
@@ -482,26 +504,12 @@ describe "RedisManager", ->
 					.calledWith("Ranges:#{@doc_id}")
 					.should.equal true
 
-		describe "with a corrupted write", ->
-			beforeEach ->
-				@badHash = "INVALID-HASH-VALUE"
-				@multi.exec = sinon.stub().callsArgWith(0, null, [@badHash])
-				@RedisManager.getDocVersion.withArgs(@doc_id).yields(null, @version - @ops.length)
-				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @callback
-
-			it 'should log a hash error', ->
-				@logger.error.calledWith()
-					.should.equal true
-
-			it "should call the callback", ->
-				@callback.called.should.equal true
-
 		describe "with null bytes in the serialized doc lines", ->
 			beforeEach ->
 				@RedisManager.getDocVersion.withArgs(@doc_id).yields(null, @version - @ops.length)
 				@_stringify = JSON.stringify
 				@JSON.stringify = () -> return '["bad bytes! \u0000 <- here"]'
-				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @callback
+				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @updateMeta, @callback
 
 			afterEach ->
 				@JSON.stringify = @_stringify
@@ -516,7 +524,7 @@ describe "RedisManager", ->
 			beforeEach ->
 				@RedisManager.getDocVersion.withArgs(@doc_id).yields(null, @version - @ops.length)
 				@RedisManager._serializeRanges = sinon.stub().yields(new Error("ranges are too large"))
-				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @callback
+				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, @updateMeta, @callback
 
 			it 'should log an error', ->
 				@logger.error.called.should.equal true
@@ -524,12 +532,26 @@ describe "RedisManager", ->
 			it "should call the callback with the error", ->
 				@callback.calledWith(new Error("ranges are too large")).should.equal true
 
+		describe "without user id from meta", ->
+			beforeEach ->
+				@RedisManager.getDocVersion.withArgs(@doc_id).yields(null, @version - @ops.length)
+				@RedisManager.updateDocument @project_id, @doc_id, @lines, @version, @ops, @ranges, {}, @callback
+
+			it "should set the last updater to null", ->
+				@multi.del
+					.calledWith("lastUpdatedBy:#{@doc_id}")
+					.should.equal true
+
+			it "should still set the last updated time", ->
+				@multi.set
+					.calledWith("lastUpdatedAt:#{@doc_id}", Date.now())
+					.should.equal true
+
 	describe "putDocInMemory", ->
 		beforeEach ->
 			@multi.set = sinon.stub()
 			@rclient.sadd = sinon.stub().yields()
 			@multi.del = sinon.stub()
-			@multi.eval = sinon.stub()
 			@lines = ["one", "two", "three", "これは"]
 			@version = 42
 			@hash = crypto.createHash('sha1').update(JSON.stringify(@lines),'utf8').digest('hex')
@@ -542,8 +564,8 @@ describe "RedisManager", ->
 				@RedisManager.putDocInMemory @project_id, @doc_id, @lines, @version, @ranges, @pathname, @projectHistoryId, done
 
 			it "should set the lines", ->
-				@multi.eval
-					.calledWith(sinon.match(/redis.call/), 1, "doclines:#{@doc_id}", JSON.stringify(@lines))
+				@multi.set
+					.calledWith("doclines:#{@doc_id}", JSON.stringify(@lines))
 					.should.equal true
 
 			it "should set the version", ->
@@ -598,15 +620,6 @@ describe "RedisManager", ->
 				@multi.set
 					.calledWith("Ranges:#{@doc_id}", JSON.stringify(@ranges))
 					.should.equal false
-
-		describe "with a corrupted write", ->
-			beforeEach (done) ->
-				@multi.exec = sinon.stub().callsArgWith(0, null, ["INVALID-HASH-VALUE"])
-				@RedisManager.putDocInMemory @project_id, @doc_id, @lines, @version, @ranges, @pathname, @projectHistoryId, done
-
-			it 'should log a hash error', ->
-				@logger.error.calledWith()
-					.should.equal true
 
 		describe "with null bytes in the serialized doc lines", ->
 			beforeEach ->
@@ -680,6 +693,17 @@ describe "RedisManager", ->
 			@multi.del
 				.calledWith("ProjectHistoryId:#{@doc_id}")
 				.should.equal true
+
+		it "should delete lastUpdatedAt", ->
+			@multi.del
+				.calledWith("lastUpdatedAt:#{@doc_id}")
+				.should.equal true
+
+		it "should delete lastUpdatedBy", ->
+			@multi.del
+				.calledWith("lastUpdatedBy:#{@doc_id}")
+				.should.equal true
+
 
 	describe "clearProjectState", ->
 		beforeEach (done) ->

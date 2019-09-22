@@ -1,10 +1,14 @@
+Metrics = require "metrics-sharelatex"
+Metrics.initialize("doc-updater")
+
 express = require('express')
 http = require("http")
 Settings = require('settings-sharelatex')
 logger = require('logger-sharelatex')
-logger.initialize("documentupdater")
-logger.logger.serializers.docs = require("./app/js/LoggerSerializers").docs
-logger.logger.serializers.files = require("./app/js/LoggerSerializers").files
+logger.initialize("document-updater")
+
+logger.logger.addSerializers(require("./app/js/LoggerSerializers"))
+
 if Settings.sentry?.dsn?
 	logger.initializeErrorReporting(Settings.sentry.dsn)
 
@@ -12,10 +16,11 @@ RedisManager = require('./app/js/RedisManager')
 DispatchManager = require('./app/js/DispatchManager')
 Errors = require "./app/js/Errors"
 HttpController = require "./app/js/HttpController"
+mongojs = require "./app/js/mongojs"
+async = require "async"
 
 Path = require "path"
-Metrics = require "metrics-sharelatex"
-Metrics.initialize("doc-updater")
+
 Metrics.mongodb.monitor(Path.resolve(__dirname + "/node_modules/mongojs/node_modules/mongodb"), logger)
 Metrics.event_loop.monitor(logger, 100)
 
@@ -24,6 +29,7 @@ app.configure ->
 	app.use(Metrics.http.monitor(logger));
 	app.use express.bodyParser()
 	app.use app.router
+Metrics.injectMetricsRoute(app)
 
 DispatchManager.createAndStartDispatchers(Settings.dispatcherCount || 10)
 
@@ -56,6 +62,8 @@ app.post   '/project/:project_id/doc/:doc_id/change/:change_id/accept', HttpCont
 app.post   '/project/:project_id/doc/:doc_id/change/accept',            HttpController.acceptChanges
 app.del    '/project/:project_id/doc/:doc_id/comment/:comment_id',      HttpController.deleteComment
 
+app.get    '/flush_all_projects',                                       HttpController.flushAllProjects
+
 app.get '/total', (req, res)->
 	timer = new Metrics.Timer("http.allDocList")	
 	RedisManager.getCountOfDocsInMemory (err, count)->
@@ -68,20 +76,43 @@ app.get '/status', (req, res)->
 	else
 		res.send('document updater is alive')
 
-webRedisClient = require("redis-sharelatex").createClient(Settings.redis.realtime)
+pubsubClient = require("redis-sharelatex").createClient(Settings.redis.pubsub)
 app.get "/health_check/redis", (req, res, next) ->
-	webRedisClient.healthCheck (error) ->
+	pubsubClient.healthCheck (error) ->
 		if error?
 			logger.err {err: error}, "failed redis health check"
 			res.send 500
 		else
 			res.send 200
-
+			
 docUpdaterRedisClient = require("redis-sharelatex").createClient(Settings.redis.documentupdater)
 app.get "/health_check/redis_cluster", (req, res, next) ->
 	docUpdaterRedisClient.healthCheck (error) ->
 		if error?
 			logger.err {err: error}, "failed redis cluster health check"
+			res.send 500
+		else
+			res.send 200
+
+app.get "/health_check", (req, res, next) ->
+	async.series [
+		(cb) -> 
+			pubsubClient.healthCheck (error) ->
+				if error?
+					logger.err {err: error}, "failed redis health check"
+				cb(error)
+		(cb) ->
+			docUpdaterRedisClient.healthCheck (error) ->
+				if error?
+					logger.err {err: error}, "failed redis cluster health check"
+				cb(error)
+		(cb) ->
+			mongojs.healthCheck (error) ->
+				if error?
+					logger.err {err: error}, "failed mongo health check"
+				cb(error)
+	] , (error) ->
+		if error?
 			res.send 500
 		else
 			res.send 200
